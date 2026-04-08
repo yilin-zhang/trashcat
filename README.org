@@ -1,0 +1,40 @@
+#+TITLE: Trashcat 🗑️
+
+Trashcat is an Emacs package for thoroughly removing macOS applications and
+their residual files. It finds the =.app= bundle along with leftover files in
+common =Library/= locations and presents them in an interactive buffer where
+you can review, toggle, and move the selected items to the Trash.
+
+* Installation
+#+begin_src elisp
+(use-package trashcat
+  :ensure nil
+  :load-path "path/to/trashcat/repo"
+  :commands (trashcat))
+#+end_src
+
+* Quick start
+- =M-x trashcat= and pick an application from the completion list
+- Press =C-u M-x trashcat= to type an app name directly
+
+* List buffer key bindings
+| Key     | Command                  | Description                  |
+|---------+--------------------------+------------------------------|
+| SPC/RET | =trashcat-toggle-at-point= | Toggle selection at point    |
+| a       | =trashcat-select-all=      | Select all files             |
+| n       | =trashcat-select-none=     | Deselect all files           |
+| r       | =trashcat-remove-selected= | Move selected files to Trash |
+| g       | =trashcat-refresh=         | Rescan files                 |
+| q       | =quit-window=              | Quit                         |
+| ?       | =trashcat-help=            | Show help                    |
+
+* Customization
+- =trashcat-app-locations=: directories scanned for =.app= bundles
+- =trashcat-residual-locations=: common =Library/= paths to search for residual files
+
+* Notes
+Trashcat relies on macOS tools (=plutil=, =du=, =osascript= / =trash=). It is
+not expected to work on other platforms.
+
+* License
+GPL-3.0
