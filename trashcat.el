@@ -1,10 +1,10 @@
-;;; trashcat.el --- Clean up macOS applications and their residual files -*- lexical-binding: t; -*-
+;;; trashcat.el --- Clean up macOS apps and their residual files -*- lexical-binding: t; -*-
 
 ;; Copyright (C) 2026
 
 ;; Author: Yilin Zhang
 ;; Maintainer: Yilin Zhang
-;; Version: 0.1.0
+;; Version: 0.2.0
 ;; Package-Requires: ((emacs "27.1"))
 ;; Keywords: convenience, tools
 ;; URL: https://github.com/yilin-zhang/trashcat
@@ -26,503 +26,653 @@
 
 ;;; Commentary:
 ;;
-;; Trashcat is an Emacs package for thoroughly removing macOS applications
-;; and their residual files.  It provides a user-friendly interface to find
-;; and remove application bundles along with associated files from common
-;; locations such as Library/Application Support, Library/Caches,
-;; Library/Preferences, and so on.
+;; Trashcat finds macOS application bundles and their residual files, then
+;; moves them to the Trash after interactive review.
+;;
+;; Usage: M-x trashcat, pick an application.  The resulting buffer lists
+;; every item found (the .app plus residual files in ~/Library).  Entries
+;; start marked `D' (delete).  Review, unmark any false positives, and
+;; press `x' to move them to the Trash.
+;;
+;; Discovery is performed by functions on `trashcat-source-functions'.
+;; Each function receives a plist `(:app-names :app-path :bundle-id)' and
+;; returns a list of `trashcat-entry' structs.  Add your own source for
+;; extra locations.
 
 ;;; Code:
 
 (require 'cl-lib)
 (require 'seq)
 (require 'subr-x)
+(require 'tabulated-list)
 
-;; Define file record structure
-(cl-defstruct (trashcat-file
-               (:constructor trashcat-file-create)
-               (:copier nil))
-  id          ; Unique ID for the file
-  type        ; Type of file (e.g., "App Bundle", "Application Support")
-  path        ; Full path to the file
-  size        ; Size in bytes
-  selected)   ; Boolean indicating if selected for removal
+
+;;; Customization ----------------------------------------------------------
 
 (defgroup trashcat nil
-  "Settings for the Trashcat application cleaner."
+  "Clean up macOS applications and their residual files."
   :group 'tools
   :prefix "trashcat-")
 
-(defcustom trashcat-residual-locations
-  '(("Application Support" . "Library/Application Support")
-    ("Caches" . "Library/Caches")
-    ("Preferences" . "Library/Preferences")
-    ("Logs" . "Library/Logs")
-    ("Saved Application State" . "Library/Saved Application State")
-    ("Containers" . "Library/Containers")
-    ("Group Containers" . "Library/Group Containers"))
-  "Common locations for app residual files."
-  :type '(alist :key-type string :value-type string)
-  :group 'trashcat)
-
 (defcustom trashcat-app-locations
-  '("/Applications"
-    "~/Applications")
-  "Common locations for macOS applications."
+  '("/Applications" "~/Applications")
+  "Directories scanned for `.app' bundles."
   :type '(repeat directory)
   :group 'trashcat)
 
-;; Internal variables
-(defvar trashcat--app-name nil
-  "Name of the application being processed.")
+(defcustom trashcat-residual-locations
+  '((app-support      . "Library/Application Support")
+    (caches           . "Library/Caches")
+    (preferences      . "Library/Preferences")
+    (logs             . "Library/Logs")
+    (saved-state      . "Library/Saved Application State")
+    (containers       . "Library/Containers")
+    (group-containers . "Library/Group Containers")
+    (launch-agents    . "Library/LaunchAgents")
+    (http-storages    . "Library/HTTPStorages")
+    (webkit           . "Library/WebKit")
+    (cookies          . "Library/Cookies"))
+  "Alist of (TYPE . REL-PATH) for residual-file locations.
+REL-PATH is resolved relative to `$HOME'.  TYPE is a symbol used as
+the entry's type tag in the list buffer."
+  :type '(alist :key-type symbol :value-type string)
+  :group 'trashcat)
 
-(defvar trashcat--bundle-id nil
-  "Bundle identifier of the application.")
+(defcustom trashcat-source-functions
+  '(trashcat-source-app-bundle
+    trashcat-source-library-residuals
+    trashcat-source-preferences-byhost)
+  "Functions that discover entries for an application.
+Each function receives a plist with keys `:app-names' (list of string),
+`:app-path' (string), and `:bundle-id' (string or nil), and returns a
+list of `trashcat-entry' structs."
+  :type '(repeat function)
+  :group 'trashcat)
 
-(defvar trashcat--files nil
-  "List of files found for the current application.")
+(defcustom trashcat-check-running t
+  "If non-nil, warn when trashing an app bundle whose process is running."
+  :type 'boolean
+  :group 'trashcat)
 
-(defvar trashcat--buffer-name "*Trashcat*"
-  "Name of the Trashcat buffer.")
 
-(defvar trashcat-mode-map
-  (let ((map (make-sparse-keymap)))
-    (define-key map (kbd "RET") 'trashcat-toggle-at-point)
-    (define-key map (kbd "SPC") 'trashcat-toggle-at-point)
-    (define-key map (kbd "a") 'trashcat-select-all)
-    (define-key map (kbd "n") 'trashcat-select-none)
-    (define-key map (kbd "r") 'trashcat-remove-selected)
-    (define-key map (kbd "g") 'trashcat-refresh)
-    (define-key map (kbd "q") 'quit-window)
-    (define-key map (kbd "?") 'trashcat-help)
-    map)
-  "Keymap for `trashcat-mode'.")
-
-(define-derived-mode trashcat-mode special-mode "Trashcat"
-  "Major mode for the Trashcat app cleaner.
-\\{trashcat-mode-map}"
-  :group 'trashcat
-  (buffer-disable-undo)
-  (setq truncate-lines t
-        buffer-read-only t))
-
-(defface trashcat-app-name-face
-  '((t :inherit font-lock-keyword-face :weight bold))
-  "Face for application name.")
-
-(defface trashcat-path-face
-  '((t :inherit font-lock-string-face))
-  "Face for file paths.")
+;;; Faces ------------------------------------------------------------------
 
 (defface trashcat-type-face
   '((t :inherit font-lock-type-face))
-  "Face for file types.")
+  "Face for the Type column."
+  :group 'trashcat)
 
 (defface trashcat-size-face
   '((t :inherit font-lock-constant-face))
-  "Face for file sizes.")
+  "Face for the Size column."
+  :group 'trashcat)
 
-(defface trashcat-selected-face
+(defface trashcat-path-face
+  '((t :inherit font-lock-string-face))
+  "Face for the Path column."
+  :group 'trashcat)
+
+(defface trashcat-confidence-exact-face
   '((t :inherit success))
-  "Face for selected marker.")
+  "Face for `exact' and `bundle-id' confidence entries."
+  :group 'trashcat)
 
-(defface trashcat-unselected-face
-  '((t :inherit error))
-  "Face for unselected marker.")
+(defface trashcat-confidence-name-face
+  '((t :inherit warning))
+  "Face for `name-match' confidence entries (review recommended)."
+  :group 'trashcat)
 
-(defface trashcat-header-face
-  '((t :inherit font-lock-keyword-face :height 1.2 :weight bold))
-  "Face for headers.")
 
-(defface trashcat-total-face
-  '((t :inherit font-lock-preprocessor-face :weight bold))
-  "Face for total size information.")
+;;; Data model -------------------------------------------------------------
 
-(defface trashcat-button-face
-  '((t :inherit font-lock-builtin-face :weight bold :box t))
-  "Face for buttons.")
+(cl-defstruct (trashcat-entry
+               (:constructor trashcat-entry-create)
+               (:copier nil))
+  type          ; Symbol: `bundle' or a key from `trashcat-residual-locations'
+  path          ; Absolute path string
+  size          ; Size in bytes, or nil if not yet computed
+  source        ; Symbol: which source function produced this entry
+  confidence)   ; Symbol: `exact', `bundle-id', or `name-match'
 
-;;; Utility functions
 
-(defun trashcat--generate-id ()
-  "Generate a unique ID for file records."
-  (format "%s" (random)))
+;;; Buffer-local state -----------------------------------------------------
 
-(defun trashcat--get-bundle-identifier (app-path)
-  "Extract the bundle identifier from the app's Info.plist at APP-PATH."
-  (let ((info-plist (expand-file-name "Contents/Info.plist" app-path)))
-    (when (file-exists-p info-plist)
-      (with-temp-buffer
-        (call-process "plutil" nil t nil "-convert" "xml1" "-o" "-" info-plist)
-        (goto-char (point-min))
-        (when (re-search-forward "<key>CFBundleIdentifier</key>\\s-*<string>\\([^<]+\\)</string>" nil t)
-          (setq trashcat--bundle-id (match-string 1)))))))
+(defvar-local trashcat--app-name nil
+  "Display name of the app for this buffer (user's search term).")
 
-(defun trashcat--format-size (size-bytes)
-  "Format SIZE-BYTES to human-readable size."
-  (if (= size-bytes 0)
+(defvar-local trashcat--app-info nil
+  "Discovery info plist: (:app-names :app-path :bundle-id).")
+
+(defvar-local trashcat--entries nil
+  "List of `trashcat-entry' structs currently shown in the buffer.")
+
+
+;;; Utilities --------------------------------------------------------------
+
+(defun trashcat--format-size (bytes)
+  "Format BYTES as a human-readable size string."
+  (if (zerop bytes)
       "0B"
-    (let ((size-names '("B" "KB" "MB" "GB" "TB"))
-          (size size-bytes)
+    (let ((units '("B" "KB" "MB" "GB" "TB"))
+          (size (float bytes))
           (i 0))
-      (while (and (>= size 1024) (< i (1- (length size-names))))
+      (while (and (>= size 1024) (< i (1- (length units))))
         (setq size (/ size 1024.0)
               i (1+ i)))
-      (format "%.2f %s" size (nth i size-names)))))
+      (format "%.2f %s" size (nth i units)))))
 
-(defun trashcat--get-file-size (path)
-  "Get the size of a file or directory at PATH in bytes."
-  (unless (file-exists-p path)
-    (error "File does not exist: %s" path))
+(defun trashcat--normalize-name (s)
+  "Return downcased S with spaces removed."
+  (downcase (replace-regexp-in-string " " "" s)))
 
-  (if (file-regular-p path)
-      (file-attribute-size (file-attributes path))
-    ;; For directories, use du command
-    (with-temp-buffer
-      (if (= 0 (call-process "du" nil t nil "-sk" path))
-          (progn
-            (goto-char (point-min))
-            (when (re-search-forward "^\\([0-9]+\\)" nil t)
-              (* 1024 (string-to-number (match-string 1)))))
-        ;; Fallback if du fails
-        (let ((default-directory path)
-              (total-size 0))
-          (dolist (file (directory-files-recursively path ".*" t))
-            (when (file-regular-p file)
-              (setq total-size (+ total-size (file-attribute-size (file-attributes file))))))
-          total-size)))))
 
-;;; Core functionality
+;;; Info.plist extraction --------------------------------------------------
 
-(defun trashcat-find-app-bundle (app-name)
-  "Find the application bundle path for APP-NAME."
-  (let (app-path)
-    ;; Try exact match first
-    (catch 'found
-      (dolist (location trashcat-app-locations)
-        (let ((expanded-location (expand-file-name location)))
-          (when (file-directory-p expanded-location)
-            (let ((potential-path (expand-file-name (format "%s.app" app-name) expanded-location)))
-              (when (file-directory-p potential-path)
-                (trashcat--get-bundle-identifier potential-path)
-                (setq app-path potential-path)
-                (throw 'found t))))))
+(defun trashcat--plist-string (plist-file key)
+  "Read the string value at KEY from PLIST-FILE, or nil if absent."
+  (with-temp-buffer
+    (when (zerop (call-process "plutil" nil '(t nil) nil
+                               "-extract" key "raw" "-o" "-" plist-file))
+      (let ((s (string-trim (buffer-string))))
+        (and (not (string-empty-p s)) s)))))
 
-      ;; If not found, try case-insensitive search
-      (dolist (location trashcat-app-locations)
-        (let ((expanded-location (expand-file-name location)))
-          (when (file-directory-p expanded-location)
-            (dolist (app (directory-files expanded-location))
-              (when (and (string-match-p "\\.app$" app)
-                         (string-match-p (regexp-quote (downcase app-name)) (downcase app)))
-                (let ((potential-path (expand-file-name app expanded-location)))
-                  (trashcat--get-bundle-identifier potential-path)
-                  (setq app-path potential-path)
-                  (throw 'found t))))))))
-    app-path))
+(defun trashcat--app-info (app-path app-name)
+  "Return discovery info plist for APP-PATH.
+Combines the user-supplied APP-NAME with `CFBundleName',
+`CFBundleDisplayName', and the .app filename into a deduplicated
+`:app-names' list.  `:bundle-id' is `CFBundleIdentifier' or nil."
+  (let* ((plist (expand-file-name "Contents/Info.plist" app-path))
+         (have-plist (file-exists-p plist))
+         (bid  (and have-plist
+                    (trashcat--plist-string plist "CFBundleIdentifier")))
+         (name (and have-plist
+                    (trashcat--plist-string plist "CFBundleName")))
+         (disp (and have-plist
+                    (trashcat--plist-string plist "CFBundleDisplayName")))
+         (file-name (file-name-sans-extension
+                     (file-name-nondirectory
+                      (directory-file-name app-path))))
+         (candidates (delete-dups
+                      (delq nil (list app-name file-name name disp)))))
+    (list :app-names candidates
+          :app-path  app-path
+          :bundle-id bid)))
 
-(defun trashcat-find-all-related-files (app-name)
-  "Find all files related to APP-NAME, including app bundle and residual files."
-  (let ((related-files nil)
-        (app-bundle (trashcat-find-app-bundle app-name))
-        (app-name-no-spaces (replace-regexp-in-string " " "" app-name)))
 
-    ;; Add app bundle if found
-    (when app-bundle
-      (push (trashcat-file-create
-             :id (trashcat--generate-id)
-             :type "App Bundle"
-             :path app-bundle
-             :size (trashcat--get-file-size app-bundle)
-             :selected t)
-            related-files))
+;;; Matching ---------------------------------------------------------------
 
-    ;; Find residual files in common locations
-    (dolist (location trashcat-residual-locations)
-      (let* ((location-name (car location))
-             (location-path (expand-file-name (cdr location) "~"))
-             possible-matches)
+(defun trashcat--word-in-filename-p (word filename)
+  "Return non-nil if WORD appears as a word in FILENAME.
+Word boundaries are start/end of string or any non-alphanumeric char."
+  (and (stringp word)
+       (not (string-empty-p word))
+       (let ((case-fold-search t)
+             (pattern (concat "\\(?:\\`\\|[^a-z0-9]\\)"
+                              (regexp-quote word)
+                              "\\(?:\\'\\|[^a-z0-9]\\)")))
+         (string-match-p pattern filename))))
 
-        (when (file-directory-p location-path)
-          (dolist (item (directory-files location-path))
-            (let ((item-path (expand-file-name item location-path)))
-              ;; Match by name patterns
-              (when (or (string-match-p (regexp-quote (downcase app-name)) (downcase item))
-                        (string-match-p (regexp-quote (downcase app-name-no-spaces)) (downcase item))
-                        (and trashcat--bundle-id
-                             (string-match-p (regexp-quote (downcase trashcat--bundle-id)) (downcase item))))
-                (push item-path possible-matches))))
+(defun trashcat--name-match-confidence (filename name)
+  "Return match confidence of FILENAME against a single app NAME.
+Returns `exact', `name-match', or nil."
+  (and (stringp name)
+       (not (string-empty-p name))
+       (let* ((f (downcase filename))
+              (stem (downcase (file-name-sans-extension filename)))
+              (lc (downcase name))
+              (nospaces (trashcat--normalize-name name)))
+         (cond
+          ((or (equal stem lc)
+               (equal stem nospaces))
+           'exact)
+          ((or (trashcat--word-in-filename-p lc f)
+               (trashcat--word-in-filename-p nospaces f))
+           'name-match)
+          (t nil)))))
 
-          ;; Add all matches as separate items
-          (dolist (match possible-matches)
-            (push (trashcat-file-create
-                   :id (trashcat--generate-id)
-                   :type location-name
-                   :path match
-                   :size (trashcat--get-file-size match)
-                   :selected t)
-                  related-files)))))
+(defun trashcat--bundle-id-match-confidence (filename bundle-id)
+  "Return `bundle-id' if FILENAME matches BUNDLE-ID, else nil.
+Matches exact, `bid.*', `bid-*', and `*.bid' (Group Container suffix)."
+  (and (stringp bundle-id)
+       (not (string-empty-p bundle-id))
+       (let ((f (downcase filename))
+             (bid (downcase bundle-id)))
+         (and (or (equal f bid)
+                  (string-prefix-p (concat bid ".") f)
+                  (string-prefix-p (concat bid "-") f)
+                  (string-suffix-p (concat "." bid) f))
+              'bundle-id))))
 
-    (nreverse related-files)))
+(defun trashcat--match-confidence (filename app-names bundle-id)
+  "Return confidence for FILENAME against APP-NAMES and BUNDLE-ID.
+APP-NAMES is a list of candidate name strings.  Returns the strongest
+match found among the candidates: `exact' > `bundle-id' > `name-match',
+or nil if none match."
+  (let ((name-results
+         (delq nil
+               (mapcar (lambda (n) (trashcat--name-match-confidence filename n))
+                       app-names))))
+    (cond
+     ((memq 'exact name-results) 'exact)
+     ((trashcat--bundle-id-match-confidence filename bundle-id))
+     ((memq 'name-match name-results) 'name-match)
+     (t nil))))
 
-(defun trashcat-move-to-trash (path)
-  "Move PATH to the trash using macOS's `trash` command or Emacs' delete-by-moving-to-trash."
-  (cond
-   ;; Try using macOS built-in trash command if available
-   ((executable-find "trash")
-    (= 0 (call-process "trash" nil nil nil path)))
 
-   ;; Try using AppleScript (always available on macOS)
-   (t
-    (= 0 (call-process "osascript" nil nil nil "-e"
-                       (format "tell application \"Finder\" to delete POSIX file \"%s\"" path))))))
+;;; App bundle discovery ---------------------------------------------------
 
-(defun trashcat-remove-selected-files (selected-files)
-  "Move all files in SELECTED-FILES list to the trash."
-  (let ((success t)
-        (removed-count 0))
-    (dolist (file selected-files)
-      (let ((path (trashcat-file-path file)))
-        (when (file-exists-p path)
-          (condition-case err
-              (progn
-                (if (trashcat-move-to-trash path)
-                    (cl-incf removed-count)
-                  (message "Failed to move %s to trash" path)
-                  (setq success nil))
-                )
-            (error
-             (message "Error moving %s to trash: %s" path (error-message-string err))
-             (setq success nil))))))
-    (cons success removed-count)))
+(defun trashcat--find-app-bundle (app-name)
+  "Return absolute path to the .app bundle for APP-NAME, or nil."
+  (let ((want (concat app-name ".app"))
+        (want-lc (downcase app-name)))
+    (or
+     ;; 1. Exact filename match.
+     (cl-some (lambda (loc)
+                (let* ((d (expand-file-name loc))
+                       (p (expand-file-name want d)))
+                  (and (file-directory-p p) p)))
+              trashcat-app-locations)
+     ;; 2. Case-insensitive substring fallback.
+     (cl-some
+      (lambda (loc)
+        (let ((d (expand-file-name loc)))
+          (and (file-directory-p d)
+               (cl-some
+                (lambda (name)
+                  (let ((p (expand-file-name name d)))
+                    (and (string-match-p (regexp-quote want-lc)
+                                         (downcase name))
+                         (file-directory-p p)
+                         p)))
+                (directory-files d nil "\\.app\\'")))))
+      trashcat-app-locations))))
 
-;;; UI functions
+(defun trashcat--list-installed-apps ()
+  "Return a sorted, deduplicated list of installed app names (without .app)."
+  (let (names)
+    (dolist (loc trashcat-app-locations)
+      (let ((d (expand-file-name loc)))
+        (when (file-directory-p d)
+          (dolist (f (directory-files d nil "\\.app\\'"))
+            (when (file-directory-p (expand-file-name f d))
+              (push (substring f 0 -4) names))))))
+    (sort (delete-dups names) #'string<)))
 
-(defun trashcat-render-buffer ()
-  "Render the Trashcat buffer with files list."
-  (let ((inhibit-read-only t)
-        (point-pos (point))
-        (window-start (window-start))
-        (selected-files (seq-filter #'trashcat-file-selected trashcat--files))
-        (total-size (seq-reduce (lambda (acc f) (+ acc (trashcat-file-size f))) trashcat--files 0))
-        (selected-size (seq-reduce (lambda (acc f)
-                                     (+ acc (if (trashcat-file-selected f)
-                                                (trashcat-file-size f) 0)))
-                                   trashcat--files 0)))
-    (erase-buffer)
 
-    ;; Header
-    (insert (propertize (format "Trashcat: Clean up %s\n\n" trashcat--app-name)
-                        'face 'trashcat-header-face))
+;;; Size computation -------------------------------------------------------
 
-    ;; Instructions
-    (insert "Commands: ")
-    (insert (propertize "SPC/RET" 'face 'trashcat-button-face) " Toggle selection, ")
-    (insert (propertize "a" 'face 'trashcat-button-face) " Select all, ")
-    (insert (propertize "n" 'face 'trashcat-button-face) " Select none, ")
-    (insert (propertize "r" 'face 'trashcat-button-face) " Move selected to trash, ")
-    (insert (propertize "g" 'face 'trashcat-button-face) " Refresh, ")
-    (insert (propertize "q" 'face 'trashcat-button-face) " Quit, ")
-    (insert (propertize "?" 'face 'trashcat-button-face) " Help\n\n")
+(defun trashcat--du-sizes (paths)
+  "Return a hash table mapping each path in PATHS to its size in bytes.
+Uses a single `du -sk' invocation over all PATHS."
+  (let ((sizes (make-hash-table :test 'equal)))
+    (when paths
+      (with-temp-buffer
+        (apply #'call-process "du" nil '(t nil) nil "-sk" paths)
+        (goto-char (point-min))
+        (while (re-search-forward "^\\([0-9]+\\)\t\\(.+\\)$" nil t)
+          (puthash (match-string 2)
+                   (* 1024 (string-to-number (match-string 1)))
+                   sizes))))
+    sizes))
 
-    ;; File list
-    (insert (propertize "Files related to " 'face 'font-lock-comment-face))
-    (insert (propertize trashcat--app-name 'face 'trashcat-app-name-face))
-    (insert (propertize ":\n\n" 'face 'font-lock-comment-face))
+(defun trashcat--fill-sizes (entries)
+  "Fill the :size slot of every entry in ENTRIES.  Return ENTRIES."
+  (let* ((existing (seq-filter (lambda (e)
+                                 (file-exists-p (trashcat-entry-path e)))
+                               entries))
+         (sizes (trashcat--du-sizes
+                 (mapcar #'trashcat-entry-path existing))))
+    (dolist (e entries)
+      (setf (trashcat-entry-size e)
+            (or (gethash (trashcat-entry-path e) sizes) 0)))
+    entries))
 
-    (insert (propertize (format "%-3s %-8s %-20s %-10s %s\n"
-                                "#" "Selected" "Type" "Size" "Path")
-                        'face 'font-lock-comment-face))
-    (insert (make-string (window-width) ?-) "\n")
 
-    (let ((i 1))
-      (dolist (file trashcat--files)
-        (let* ((selected-mark (if (trashcat-file-selected file) "✓" "✗"))
-               (file-size (trashcat--format-size (trashcat-file-size file)))
-               (line-start (point))
-               (type-column (format "%-20s " (trashcat-file-type file)))
-               (size-column (format "%-10s " file-size))
-               (path-column (trashcat-file-path file)))
+;;; Source functions -------------------------------------------------------
 
-          ;; Insert line number
-          (insert (format "%-3d " i))
+(defun trashcat-source-app-bundle (props)
+  "Return the .app bundle as a single entry, given discovery PROPS."
+  (when-let ((path (plist-get props :app-path)))
+    (list (trashcat-entry-create
+           :type 'bundle
+           :path path
+           :source 'app-bundle
+           :confidence 'exact))))
 
-          ;; Insert selection mark with appropriate face
-          (let ((mark-start (point)))
-            (insert (format "%-8s " selected-mark))
-            (put-text-property
-             mark-start (+ mark-start 1)
-             'face (if (trashcat-file-selected file)
-                       'trashcat-selected-face
-                     'trashcat-unselected-face)))
+(defun trashcat--scan-directory (dir type source app-names bundle-id)
+  "Return entries for items in DIR that match APP-NAMES / BUNDLE-ID.
+Each entry is tagged with TYPE and SOURCE.  Silently skips DIR when it
+cannot be listed — e.g. macOS TCC blocks `~/Library/Cookies',
+`~/Library/Safari', `~/Library/Mail' without Full Disk Access."
+  (let (entries)
+    (condition-case _err
+        (when (file-directory-p dir)
+          (dolist (item (directory-files dir nil "\\`[^.]"))
+            (when-let ((conf (trashcat--match-confidence
+                              item app-names bundle-id)))
+              (push (trashcat-entry-create
+                     :type type
+                     :path (expand-file-name item dir)
+                     :source source
+                     :confidence conf)
+                    entries))))
+      (file-error nil))
+    (nreverse entries)))
 
-          ;; Insert type, size, and path
-          (insert type-column)
-          (insert size-column)
-          (insert path-column)
-          (insert "\n")
+(defun trashcat-source-library-residuals (props)
+  "Scan `trashcat-residual-locations' for matches against PROPS."
+  (let ((app-names (plist-get props :app-names))
+        (bundle-id (plist-get props :bundle-id))
+        entries)
+    (dolist (loc trashcat-residual-locations)
+      (setq entries
+            (append entries
+                    (trashcat--scan-directory
+                     (expand-file-name (cdr loc) "~")
+                     (car loc) 'library-residuals
+                     app-names bundle-id))))
+    entries))
 
-          ;; Add text properties to the entire line
-          (add-text-properties
-           line-start (point)
-           (list 'trashcat-file file
-                 'trashcat-index i))
+(defun trashcat-source-preferences-byhost (props)
+  "Scan ~/Library/Preferences/ByHost/ for matches against PROPS.
+Covers per-host preference plists named `<bid>.<UUID>.plist'."
+  (trashcat--scan-directory
+   (expand-file-name "Library/Preferences/ByHost" "~")
+   'byhost 'preferences-byhost
+   (plist-get props :app-names)
+   (plist-get props :bundle-id)))
 
-          ;; Add face properties to specific parts
-          ;; Type column
-          (let ((type-start (- (point) (length path-column) (length size-column) (length type-column) 1)))
-            (put-text-property
-             type-start (+ type-start (length type-column))
-             'face 'trashcat-type-face))
 
-          ;; Size column
-          (let ((size-start (- (point) (length path-column) (length size-column) 1)))
-            (put-text-property
-             size-start (+ size-start (length size-column))
-             'face 'trashcat-size-face))
+;;; Discovery pipeline -----------------------------------------------------
 
-          ;; Path column
-          (put-text-property
-           (- (point) (length path-column) 1) (point)
-           'face 'trashcat-path-face)
+(defun trashcat--discover (app-info)
+  "Run every `trashcat-source-functions' against APP-INFO.
+Return a deduplicated-by-path list of entries."
+  (let (entries seen)
+    (dolist (fn trashcat-source-functions)
+      (dolist (e (funcall fn app-info))
+        (let ((p (trashcat-entry-path e)))
+          (unless (member p seen)
+            (push p seen)
+            (push e entries)))))
+    (nreverse entries)))
 
-          (setq i (1+ i)))))
 
-    ;; Summary footer
-    (insert (make-string (window-width) ?-) "\n")
-    (insert (propertize (format "Total size: %s\n"
-                                (trashcat--format-size total-size))
-                        'face 'trashcat-total-face))
-    (insert (propertize (format "Selected size: %s (%d files)\n"
-                                (trashcat--format-size selected-size)
-                                (length selected-files))
-                        'face 'trashcat-total-face))
+;;; Running-app detection --------------------------------------------------
 
-    ;; Restore point and window start
-    (set-window-start (selected-window) window-start)
-    (goto-char point-pos)))
+(defun trashcat--app-running-p (app-path)
+  "Return non-nil if APP-PATH corresponds to a running process.
+Uses `pgrep -f' to match the full command line against APP-PATH."
+  (and (executable-find "pgrep")
+       (zerop (call-process "pgrep" nil nil nil "-f"
+                            (regexp-quote app-path)))))
 
-(defun trashcat-toggle-at-point ()
-  "Toggle selection of the file at point."
+
+;;; Trashing ---------------------------------------------------------------
+
+(defun trashcat--trash (path)
+  "Move PATH to the Trash.  Return non-nil on success."
+  (condition-case _err
+      (progn
+        (if (file-directory-p path)
+            (delete-directory path t t)
+          (delete-file path t))
+        t)
+    (error nil)))
+
+(defun trashcat--trash-entries (entries)
+  "Move every entry in ENTRIES to the Trash.
+Return a plist of the form (:succeeded N :failed M :failed-paths (...))."
+  (let ((ok 0) (fail 0) failed)
+    (dolist (e entries)
+      (let ((p (trashcat-entry-path e)))
+        (if (trashcat--trash p)
+            (cl-incf ok)
+          (cl-incf fail)
+          (push p failed))))
+    (list :succeeded ok :failed fail :failed-paths (nreverse failed))))
+
+
+;;; UI: mode ---------------------------------------------------------------
+
+(defvar trashcat-mode-map
+  (let ((map (make-sparse-keymap)))
+    (define-key map (kbd "m")   #'trashcat-mark)
+    (define-key map (kbd "u")   #'trashcat-unmark)
+    (define-key map (kbd "M")   #'trashcat-mark-all)
+    (define-key map (kbd "U")   #'trashcat-unmark-all)
+    (define-key map (kbd "t")   #'trashcat-toggle-mark)
+    (define-key map (kbd "x")   #'trashcat-execute)
+    (define-key map (kbd "RET") #'trashcat-visit)
+    (define-key map (kbd "d")   #'trashcat-remove-entry)
+    (define-key map (kbd "g")   #'trashcat-refresh)
+    (define-key map (kbd "?")   #'describe-mode)
+    map)
+  "Keymap for `trashcat-mode'.")
+
+(define-derived-mode trashcat-mode tabulated-list-mode "Trashcat"
+  "Major mode for reviewing and trashing macOS application leftovers.
+
+\\{trashcat-mode-map}"
+  (setq tabulated-list-format
+        [("Type"       18 t)
+         ("Size"       10 trashcat--sort-size :right-align t)
+         ("Conf"       11 t)
+         ("Path"        0 t)]
+        tabulated-list-padding 2
+        tabulated-list-sort-key '("Size" . t))
+  (tabulated-list-init-header))
+
+
+;;; UI: rendering ----------------------------------------------------------
+
+(defun trashcat--confidence-face (conf)
+  "Return the face for confidence level CONF."
+  (pcase conf
+    ((or 'exact 'bundle-id) 'trashcat-confidence-exact-face)
+    ('name-match 'trashcat-confidence-name-face)
+    (_ 'default)))
+
+(defun trashcat--entry-to-row (entry)
+  "Convert ENTRY to a tabulated-list row `(ID VECTOR)'."
+  (let ((conf (trashcat-entry-confidence entry)))
+    (list entry
+          (vector
+           (propertize (symbol-name (trashcat-entry-type entry))
+                       'face 'trashcat-type-face)
+           (propertize (trashcat--format-size
+                        (or (trashcat-entry-size entry) 0))
+                       'face 'trashcat-size-face)
+           (propertize (symbol-name (or conf 'unknown))
+                       'face (trashcat--confidence-face conf))
+           (propertize (abbreviate-file-name (trashcat-entry-path entry))
+                       'face (trashcat--confidence-face conf))))))
+
+(defun trashcat--sort-size (a b)
+  "Compare tabulated-list rows A and B by size."
+  (< (or (trashcat-entry-size (car a)) 0)
+     (or (trashcat-entry-size (car b)) 0)))
+
+(defun trashcat--populate ()
+  "Refresh `tabulated-list-entries' from `trashcat--entries'."
+  (setq tabulated-list-entries
+        (mapcar #'trashcat--entry-to-row trashcat--entries))
+  (tabulated-list-print t))
+
+
+;;; UI: mark commands ------------------------------------------------------
+
+(defun trashcat--apply-tag (predicate tag)
+  "For each row whose ID satisfies PREDICATE, set TAG."
+  (save-excursion
+    (goto-char (point-min))
+    (while (not (eobp))
+      (let ((id (tabulated-list-get-id)))
+        (when (and id (funcall predicate id))
+          (tabulated-list-put-tag tag))
+        (forward-line 1)))))
+
+(defun trashcat--marked-entries ()
+  "Return the list of entries currently marked for deletion."
+  (let (result)
+    (save-excursion
+      (goto-char (point-min))
+      (while (not (eobp))
+        (when (eq (char-after) ?D)
+          (let ((id (tabulated-list-get-id)))
+            (when id (push id result))))
+        (forward-line 1)))
+    (nreverse result)))
+
+(defun trashcat-mark ()
+  "Mark the entry at point for deletion."
   (interactive)
-  (let ((file (get-text-property (point) 'trashcat-file)))
-    (when file
-      ;; Toggle the selected status
-      (setf (trashcat-file-selected file)
-            (not (trashcat-file-selected file)))
-      ;; Force buffer redisplay
-      (trashcat-render-buffer)
-      ;; Report the change
-      (message "%s %s"
-               (if (trashcat-file-selected file) "Selected" "Deselected")
-               (trashcat-file-path file)))))
+  (tabulated-list-put-tag "D" t))
 
-(defun trashcat-select-all ()
-  "Select all files in the list."
+(defun trashcat-unmark ()
+  "Unmark the entry at point."
   (interactive)
-  (dolist (file trashcat--files)
-    (setf (trashcat-file-selected file) t))
-  (trashcat-render-buffer)
-  (message "All files selected"))
+  (tabulated-list-put-tag " " t))
 
-(defun trashcat-select-none ()
-  "Deselect all files in the list."
+(defun trashcat-mark-all ()
+  "Mark every entry for deletion."
   (interactive)
-  (dolist (file trashcat--files)
-    (setf (trashcat-file-selected file) nil))
-  (trashcat-render-buffer)
-  (message "All files deselected"))
+  (trashcat--apply-tag (lambda (_) t) "D"))
+
+(defun trashcat-unmark-all ()
+  "Unmark every entry."
+  (interactive)
+  (trashcat--apply-tag (lambda (_) t) " "))
+
+(defun trashcat-toggle-mark ()
+  "Toggle the mark on the entry at point."
+  (interactive)
+  (if (eq (char-after) ?D)
+      (tabulated-list-put-tag " " t)
+    (tabulated-list-put-tag "D" t)))
+
+
+;;; UI: entry actions ------------------------------------------------------
+
+(defun trashcat-visit ()
+  "Open the entry at point in Dired."
+  (interactive)
+  (let ((entry (tabulated-list-get-id)))
+    (unless entry (user-error "No entry at point"))
+    (let ((path (trashcat-entry-path entry)))
+      (if (file-directory-p path)
+          (dired path)
+        (dired (file-name-directory path))))))
+
+(defun trashcat-remove-entry ()
+  "Remove the entry at point from the list (without trashing)."
+  (interactive)
+  (let ((entry (tabulated-list-get-id)))
+    (unless entry (user-error "No entry at point"))
+    (setq trashcat--entries (delq entry trashcat--entries))
+    (trashcat--populate)))
 
 (defun trashcat-refresh ()
-  "Refresh the list of files."
+  "Re-scan for residuals.  Preserves marks by path."
   (interactive)
-  (setq trashcat--files (trashcat-find-all-related-files trashcat--app-name))
-  (trashcat-render-buffer)
-  (message "File list refreshed"))
+  (unless trashcat--app-info
+    (user-error "Not a Trashcat buffer"))
+  (let ((marked (mapcar #'trashcat-entry-path (trashcat--marked-entries))))
+    (setq trashcat--entries
+          (trashcat--fill-sizes (trashcat--discover trashcat--app-info)))
+    (trashcat--populate)
+    (trashcat--apply-tag
+     (lambda (id) (member (trashcat-entry-path id) marked))
+     "D")
+    (message "Refreshed: %d entries" (length trashcat--entries))))
 
-(defun trashcat-remove-selected ()
-  "Move all selected files to trash."
+(defun trashcat--confirm-running (entries)
+  "If ENTRIES contains the app bundle and it is running, confirm with the user.
+Return non-nil to proceed, nil to abort."
+  (or (not trashcat-check-running)
+      (let ((bundle-entry
+             (seq-find (lambda (e) (eq (trashcat-entry-type e) 'bundle))
+                       entries)))
+        (not bundle-entry))
+      (let ((app-path (plist-get trashcat--app-info :app-path)))
+        (not (trashcat--app-running-p app-path)))
+      (yes-or-no-p
+       (format "%s appears to be running.  Trash anyway? "
+               trashcat--app-name))))
+
+(defun trashcat-execute ()
+  "Move all marked entries to the Trash."
   (interactive)
-  (let* ((selected-files (seq-filter #'trashcat-file-selected trashcat--files))
-         (selected-size (seq-reduce (lambda (acc f) (+ acc (trashcat-file-size f)))
-                                    selected-files 0))
-         (file-count (length selected-files)))
+  (let* ((entries (trashcat--marked-entries))
+         (n (length entries))
+         (total (seq-reduce
+                 (lambda (acc e) (+ acc (or (trashcat-entry-size e) 0)))
+                 entries 0)))
+    (cond
+     ((zerop n)
+      (user-error "No entries marked"))
+     ((not (yes-or-no-p
+            (format "Move %d item%s (%s) to Trash? "
+                    n (if (= n 1) "" "s")
+                    (trashcat--format-size total))))
+      (message "Cancelled"))
+     ((not (trashcat--confirm-running entries))
+      (message "Cancelled"))
+     (t
+      (let* ((result (trashcat--trash-entries entries))
+             (ok (plist-get result :succeeded))
+             (failed (plist-get result :failed))
+             (failed-paths (plist-get result :failed-paths))
+             (succeeded (seq-remove
+                         (lambda (e)
+                           (member (trashcat-entry-path e) failed-paths))
+                         entries)))
+        (setq trashcat--entries
+              (cl-set-difference trashcat--entries succeeded :test #'eq))
+        (trashcat--populate)
+        (when failed-paths
+          (trashcat--apply-tag
+           (lambda (id) (member (trashcat-entry-path id) failed-paths))
+           "D")
+          (dolist (p failed-paths)
+            (message "Failed: %s" p)))
+        (message "Trashed %d of %d item%s%s"
+                 ok n (if (= n 1) "" "s")
+                 (if (zerop failed) "" (format " (%d failed)" failed))))))))
 
-    (if (null selected-files)
-        (message "No files selected for trash")
-      (when (yes-or-no-p
-             (format "Move %d selected files (%s) to trash? "
-                     file-count (trashcat--format-size selected-size)))
-        (let ((result (trashcat-remove-selected-files selected-files)))
-          (if (car result)
-              (progn
-                (message "Successfully moved %d files to trash" (cdr result))
-                (trashcat-refresh))
-            (message "Some files could not be moved to trash")))))))
 
-(defun trashcat-help ()
-  "Show help for Trashcat mode."
-  (interactive)
-  (with-help-window "*Trashcat Help*"
-    (princ "Trashcat: Clean up macOS applications and their residual files\n\n")
-    (princ "Key bindings:\n")
-    (princ "  SPC, RET  Toggle selection of file at point\n")
-    (princ "  a         Select all files\n")
-    (princ "  n         Deselect all files\n")
-    (princ "  r         Move selected files to trash\n")
-    (princ "  g         Refresh file list\n")
-    (princ "  q         Quit Trashcat\n")
-    (princ "  ?         Show this help\n\n")
-    (princ "Trashcat scans for and helps you move to trash:\n")
-    (princ "- Application bundles (.app)\n")
-    (princ "- Residual files from common locations:\n")
-    (dolist (loc trashcat-residual-locations)
-      (princ (format "  - %s\n" (car loc))))))
-
-(defun trashcat-get-app-list ()
-  "Get list of installed applications from common locations."
-  (let ((app-list nil))
-    (dolist (location trashcat-app-locations)
-      (let ((expanded-location (expand-file-name location)))
-        (when (file-directory-p expanded-location)
-          (dolist (app (directory-files expanded-location))
-            (when (and (string-match-p "\\.app$" app)
-                       (file-directory-p (expand-file-name app expanded-location)))
-              (push (substring app 0 -4) app-list))))))
-    (sort app-list #'string<)))
+;;; Entry point ------------------------------------------------------------
 
 ;;;###autoload
 (defun trashcat (app-name)
-  "Start Trashcat to clean up APP-NAME and its residual files.
-When called interactively with no prefix argument, prompt for an application
-from a list. With prefix argument, prompt for direct input of application name."
+  "Start Trashcat on APP-NAME.
+With a prefix argument, prompt for the application name as free text
+rather than selecting from a completion list."
   (interactive
    (list
     (if current-prefix-arg
         (read-string "Application name: ")
-      (let ((apps (trashcat-get-app-list)))
+      (let ((apps (trashcat--list-installed-apps)))
         (if apps
-            (completing-read "Select application: " apps nil t)
+            (completing-read "Application: " apps nil t)
           (read-string "Application name: "))))))
-
-  (setq trashcat--app-name app-name
-        trashcat--bundle-id nil)
-
-  (let ((app-bundle (trashcat-find-app-bundle app-name)))
-    (unless app-bundle
-      (user-error "Could not find application '%s'" app-name))
-
-    (message "Found app bundle: %s" app-bundle)
-    (setq trashcat--files (trashcat-find-all-related-files app-name))
-
-    (if (null trashcat--files)
-        (user-error "No files found for '%s'" app-name)
-
-      ;; Switch to or create Trashcat buffer
-      (let ((buffer (get-buffer-create trashcat--buffer-name)))
-        (switch-to-buffer buffer)
-        (trashcat-mode)
-        (trashcat-render-buffer)))))
+  (let ((app-path (trashcat--find-app-bundle app-name)))
+    (unless app-path
+      (user-error "Could not find application %s" app-name))
+    (let* ((info (trashcat--app-info app-path app-name))
+           (entries (trashcat--fill-sizes (trashcat--discover info))))
+      (unless entries
+        (user-error "No files found for %s" app-name))
+      (let ((buf (get-buffer-create (format "*trashcat: %s*" app-name))))
+        (with-current-buffer buf
+          (trashcat-mode)
+          (setq trashcat--app-name app-name
+                trashcat--app-info info
+                trashcat--entries entries)
+          (trashcat--populate)
+          (trashcat-mark-all))
+        (pop-to-buffer buf)))))
 
 (provide 'trashcat)
+
 ;;; trashcat.el ends here

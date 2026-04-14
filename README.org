@@ -1,9 +1,10 @@
 #+TITLE: Trashcat 🗑️
 
-Trashcat is an Emacs package for thoroughly removing macOS applications and
-their residual files. It finds the =.app= bundle along with leftover files in
-common =Library/= locations and presents them in an interactive buffer where
-you can review, toggle, and move the selected items to the Trash.
+Trashcat is an Emacs package for thoroughly removing macOS applications
+and their residual files. It locates the =.app= bundle plus leftover
+files in =~/Library/=, presents them in an interactive
+=tabulated-list-mode= buffer, and moves selected items to the Trash via
+Emacs' native =move-file-to-trash=.
 
 * Installation
 #+begin_src elisp
@@ -14,27 +15,103 @@ you can review, toggle, and move the selected items to the Trash.
 #+end_src
 
 * Quick start
-- =M-x trashcat= and pick an application from the completion list
-- Press =C-u M-x trashcat= to type an app name directly
+- =M-x trashcat= and pick an application from the completion list.
+- Press =C-u M-x trashcat= to type the app name directly.
+- The resulting buffer starts with every entry marked =D= (delete).
+  Review the list, unmark anything suspicious (watch the =Conf=
+  column), then press =x= to move the marked items to the Trash.
 
-* List buffer key bindings
-| Key     | Command                  | Description                  |
-|---------+--------------------------+------------------------------|
-| SPC/RET | =trashcat-toggle-at-point= | Toggle selection at point    |
-| a       | =trashcat-select-all=      | Select all files             |
-| n       | =trashcat-select-none=     | Deselect all files           |
-| r       | =trashcat-remove-selected= | Move selected files to Trash |
-| g       | =trashcat-refresh=         | Rescan files                 |
-| q       | =quit-window=              | Quit                         |
-| ?       | =trashcat-help=            | Show help                    |
+* Key bindings
+| Key | Command                 | Description                        |
+|-----+-------------------------+------------------------------------|
+| m   | =trashcat-mark=         | Mark entry at point for deletion   |
+| u   | =trashcat-unmark=       | Unmark entry at point              |
+| M   | =trashcat-mark-all=     | Mark every entry                   |
+| U   | =trashcat-unmark-all=   | Unmark every entry                 |
+| t   | =trashcat-toggle-mark=  | Toggle mark at point               |
+| x   | =trashcat-execute=      | Move marked entries to the Trash   |
+| RET | =trashcat-visit=        | Open entry at point in Dired       |
+| d   | =trashcat-remove-entry= | Drop from list (does *not* trash)  |
+| g   | =trashcat-refresh=      | Rescan (marks preserved by path)   |
+| ?   | =describe-mode=         | Show help                          |
+| q   | =quit-window=           | Bury the buffer                    |
+
+Sorting and navigation keys from =tabulated-list-mode= also apply
+(e.g. =S= to sort by the column at point, =n=/=p= to move).
+
+* Confidence column
+Each entry carries a confidence level:
+
+- =exact= — filename (with or without extension) equals one of the
+  candidate names. Safe default.
+- =bundle-id= — filename matches the bundle identifier as full name,
+  prefix (=bid.*= / =bid-*=), or suffix (=*.bid=, common in Group
+  Containers with team-id prefixes).
+- =name-match= — one of the candidate names appears as a separate word
+  in the filename. Weakest tier; rendered in a warning face. Review
+  before trashing.
+
+"Candidate names" for an app include the user's search term, the =.app=
+filename, =CFBundleName=, and =CFBundleDisplayName=. This lets Trashcat
+catch residuals stored under an app's internal short name
+(e.g. =Visual Studio Code.app= stores data in =Code/=).
+
+* Sources
+Discovery runs every function in =trashcat-source-functions=. Defaults:
+
+- =trashcat-source-app-bundle= — the =.app= itself.
+- =trashcat-source-library-residuals= — top level of every
+  =trashcat-residual-locations= entry (Application Support, Caches,
+  Preferences, Logs, Saved Application State, Containers, Group
+  Containers, LaunchAgents, HTTPStorages, WebKit, Cookies).
+- =trashcat-source-preferences-byhost= — per-host plists under
+  =~/Library/Preferences/ByHost/=.
+
+Each source receives =(:app-names LIST :app-path STR :bundle-id STR)=
+and returns a list of =trashcat-entry= structs. Add your own function
+to scan extra locations:
+
+#+begin_src elisp
+(defun my/trashcat-plugins-source (props)
+  (trashcat--scan-directory
+   (expand-file-name "Library/Audio/Plug-Ins" "~")
+   'audio-plugins 'my-plugins-source
+   (plist-get props :app-names)
+   (plist-get props :bundle-id)))
+
+(add-to-list 'trashcat-source-functions #'my/trashcat-plugins-source)
+#+end_src
 
 * Customization
-- =trashcat-app-locations=: directories scanned for =.app= bundles
-- =trashcat-residual-locations=: common =Library/= paths to search for residual files
+- =trashcat-app-locations= — directories scanned for =.app= bundles.
+- =trashcat-residual-locations= — alist of =(TYPE . REL-PATH)= under
+  =$HOME= used by =trashcat-source-library-residuals=.
+- =trashcat-source-functions= — functions run during discovery.
+- =trashcat-check-running= — if non-nil (default), confirm before
+  trashing a =.app= whose process is currently running
+  (detected via =pgrep -f=).
+
+* Running the tests
+#+begin_src sh
+emacsclient --eval "(progn \
+  (add-to-list 'load-path \"$PWD\") \
+  (add-to-list 'load-path \"$PWD/tests\") \
+  (require 'trashcat) \
+  (require 'trashcat-test) \
+  (ert-run-tests-batch \"^trashcat\"))"
+#+end_src
 
 * Notes
-Trashcat relies on macOS tools (=plutil=, =du=, =osascript= / =trash=). It is
-not expected to work on other platforms.
+Trashcat depends on macOS tools (=plutil=, =du=, =pgrep=) and Emacs'
+native =move-file-to-trash= (which invokes =NSWorkspace= on macOS).
+Not expected to work on other platforms.
+
+Some residual locations (=~/Library/Cookies=, =~/Library/Safari=,
+=~/Library/Mail=, …) are protected by macOS TCC and return
+"Operation not permitted" unless Emacs has been granted Full Disk
+Access in System Settings → Privacy & Security. Trashcat silently
+skips any location it cannot list; grant FDA if you want those
+locations scanned.
 
 * License
 GPL-3.0
