@@ -332,7 +332,7 @@ Uses a single `du -sk' invocation over all PATHS."
 
 (defun trashcat-source-app-bundle (props)
   "Return the .app bundle as a single entry, given discovery PROPS."
-  (when-let ((path (plist-get props :app-path)))
+  (when-let* ((path (plist-get props :app-path)))
     (list (trashcat-entry-create
            :type 'bundle
            :path path
@@ -348,7 +348,7 @@ cannot be listed — e.g. macOS TCC blocks `~/Library/Cookies',
     (condition-case _err
         (when (file-directory-p dir)
           (dolist (item (directory-files dir nil "\\`[^.]"))
-            (when-let ((conf (trashcat--match-confidence
+            (when-let* ((conf (trashcat--match-confidence
                               item app-names bundle-id)))
               (push (trashcat-entry-create
                      :type type
