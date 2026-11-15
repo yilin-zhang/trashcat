@@ -9,8 +9,7 @@ Emacs' native =move-file-to-trash=.
 * Installation
 #+begin_src elisp
 (use-package trashcat
-  :ensure nil
-  :load-path "path/to/trashcat/repo"
+  :vc (:url "https://github.com/yilin-zhang/trashcat" :rev :newest)
   :commands (trashcat))
 #+end_src
 
